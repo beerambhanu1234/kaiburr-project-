@@ -1,0 +1,138 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: task-service
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-test:
+    name: Build and Test (Maven)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: task-service
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: 'maven'
+
+      - name: Maven - Compile and Unit Tests
+        run: mvn -B -e -DskipTests=false test
+
+      - name: Maven - Package (skip tests)
+        run: mvn -B -e -DskipTests package
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-service-jar
+          path: task-service/target/*.jar
+
+  docker:
+    name: Docker Build and Push
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.IMAGE_TAG }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: task-service
+          file: task-service/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Expose image ref
+        id: image
+        run: |
+          echo "image_ref=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+      - name: Upload image ref artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-ref
+          path: |
+            /home/runner/work/${{ github.event.repository.name }}/${{ github.event.repository.name }}/.github # dummy path for artifact trigger
+          if-no-files-found: ignore
+
+  deploy:
+    name: Deploy to Kubernetes (optional)
+    runs-on: ubuntu-latest
+    needs: docker
+    if: ${{ secrets.KUBECONFIG != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image ref (from previous job)
+        uses: actions/download-artifact@v4
+        with:
+          name: image-ref
+          path: ./artifact
+
+      - name: Set image ref from metadata
+        id: setimg
+        run: |
+          IMAGE_REF=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          echo "IMAGE_REF=$IMAGE_REF" >> $GITHUB_ENV
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Write kubeconfig
+        run: |
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/rbac.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/mongodb-statefulset.yaml
+          kubectl apply -f k8s/app-service.yaml
+          kubectl apply -f k8s/app-deployment.yaml
+
+      - name: Patch deployment image to built image
+        run: |
+          # Update image to GHCR ref, namespace per manifest
+          kubectl -n task-system set image deployment/task-service task-service=${IMAGE_REF}
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n task-system rollout status deployment/task-service --timeout=120s
